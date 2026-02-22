@@ -1,0 +1,14 @@
+{
+  "name": "p2p-signalling-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight, game-agnostic WebRTC signalling server.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.1"
+  }
+}
