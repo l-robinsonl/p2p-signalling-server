@@ -3,7 +3,7 @@ main = "src/worker.js"
 compatibility_date = "2026-02-22"
 
 [vars]
-MAX_ROOM_SIZE = "8"
+MAX_ROOM_SIZE = "64"
 
 [durable_objects]
 bindings = [

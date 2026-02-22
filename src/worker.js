@@ -33,6 +33,30 @@ function json(payload, status = 200) {
   });
 }
 
+function normalizeDisplayName(value) {
+  const cleaned = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 24);
+  return cleaned || "Player";
+}
+
+function normalizePresenceStatus(value) {
+  return value === "playing" ? "playing" : "lobby";
+}
+
+function normalizeMeta(input) {
+  const meta = input && typeof input === "object" ? input : {};
+  return {
+    name: normalizeDisplayName(meta.name),
+    status: normalizePresenceStatus(meta.status),
+  };
+}
+
+function randomSuffix() {
+  return Math.floor(Math.random() * 900 + 100);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -65,9 +89,43 @@ export class SignalHub {
   }
 
   maxRoomSize() {
-    const raw = Number(this.env.MAX_ROOM_SIZE ?? 8);
-    if (!Number.isFinite(raw) || raw < 2) return 8;
+    const raw = Number(this.env.MAX_ROOM_SIZE ?? 64);
+    if (!Number.isFinite(raw) || raw < 2) return 64;
     return Math.floor(raw);
+  }
+
+  roomUsedNames(key, ignoreId = null) {
+    const members = this.rooms.get(key);
+    const used = new Set();
+    if (!members) return used;
+    for (const memberId of members) {
+      if (ignoreId && memberId === ignoreId) continue;
+      const member = this.clients.get(memberId);
+      const name = member?.meta?.name;
+      if (typeof name === "string" && name) {
+        used.add(name.toLowerCase());
+      }
+    }
+    return used;
+  }
+
+  uniqueName(baseName, key, ignoreId = null) {
+    const base = normalizeDisplayName(baseName);
+    const used = this.roomUsedNames(key, ignoreId);
+    if (!used.has(base.toLowerCase())) return base;
+
+    for (let i = 0; i < 500; i++) {
+      const candidate = `${base}${randomSuffix()}`;
+      if (!used.has(candidate.toLowerCase())) return candidate;
+    }
+
+    let n = 2;
+    while (n < 10000) {
+      const candidate = `${base}${n}`;
+      if (!used.has(candidate.toLowerCase())) return candidate;
+      n++;
+    }
+    return `${base}${Date.now() % 100000}`;
   }
 
   leaveRoom(clientId) {
@@ -85,13 +143,53 @@ export class SignalHub {
             wsJson(member.ws, { type: "peer-left", id: clientId });
           }
         }
-        if (members.size === 0) {
-          this.rooms.delete(key);
-        }
+        if (members.size === 0) this.rooms.delete(key);
       }
     }
 
     this.clients.delete(clientId);
+  }
+
+  relayPeerMeta(client, includeSelfAck = true) {
+    if (!client.app || !client.room) return;
+    const key = roomKey(client.app, client.room);
+    const members = this.rooms.get(key);
+    if (!members) return;
+
+    if (includeSelfAck) {
+      wsJson(client.ws, { type: "meta-updated", id: client.id, meta: client.meta });
+    }
+
+    for (const peerId of members) {
+      if (peerId === client.id) continue;
+      const peer = this.clients.get(peerId);
+      if (!peer) continue;
+      wsJson(peer.ws, { type: "peer-meta", id: client.id, meta: client.meta });
+    }
+  }
+
+  handleSetMeta(client, patch) {
+    if (!patch || typeof patch !== "object") {
+      wsJson(client.ws, { type: "error", reason: "invalid-meta-patch" });
+      return;
+    }
+
+    const next = {
+      name: client.meta?.name ?? "Player",
+      status: client.meta?.status ?? "lobby",
+    };
+
+    if (Object.prototype.hasOwnProperty.call(patch, "name")) {
+      const key = roomKey(client.app, client.room);
+      next.name = this.uniqueName(normalizeDisplayName(patch.name), key, client.id);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(patch, "status")) {
+      next.status = normalizePresenceStatus(patch.status);
+    }
+
+    client.meta = next;
+    this.relayPeerMeta(client, true);
   }
 
   handleJoinedClientMessage(client, msg) {
@@ -121,6 +219,32 @@ export class SignalHub {
       return;
     }
 
+    if (msg.type === "direct") {
+      const targetId = msg.to;
+      if (typeof targetId !== "string") {
+        wsJson(client.ws, { type: "error", reason: "missing-target" });
+        return;
+      }
+
+      const target = this.clients.get(targetId);
+      if (!target) {
+        wsJson(client.ws, { type: "error", reason: "peer-not-found", to: targetId });
+        return;
+      }
+
+      if (target.app !== client.app || target.room !== client.room) {
+        wsJson(client.ws, { type: "error", reason: "peer-outside-room", to: targetId });
+        return;
+      }
+
+      wsJson(target.ws, {
+        type: "direct",
+        from: client.id,
+        payload: msg.payload ?? null,
+      });
+      return;
+    }
+
     if (msg.type === "broadcast") {
       const key = roomKey(client.app, client.room);
       const members = this.rooms.get(key);
@@ -136,6 +260,11 @@ export class SignalHub {
           payload: msg.payload ?? null,
         });
       }
+      return;
+    }
+
+    if (msg.type === "set-meta") {
+      this.handleSetMeta(client, msg.patch);
       return;
     }
 
@@ -171,13 +300,21 @@ export class SignalHub {
       return;
     }
 
+    const nextMeta = normalizeMeta(meta);
+    nextMeta.name = this.uniqueName(nextMeta.name, key, client.id);
+
     const peers = Array.from(members);
+    const peerMeta = peers.map((peerId) => {
+      const peer = this.clients.get(peerId);
+      return { id: peerId, meta: peer?.meta ?? null };
+    });
+
     members.add(client.id);
     this.rooms.set(key, members);
 
     client.app = app;
     client.room = room;
-    client.meta = meta ?? null;
+    client.meta = nextMeta;
 
     wsJson(client.ws, {
       type: "welcome",
@@ -185,6 +322,8 @@ export class SignalHub {
       app,
       room,
       peers,
+      peerMeta,
+      meta: client.meta,
       maxRoomSize,
     });
 

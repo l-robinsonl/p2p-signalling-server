@@ -7,7 +7,7 @@ import { WebSocketServer } from "ws";
 
 const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? 8787);
-const MAX_ROOM_SIZE = Number(process.env.MAX_ROOM_SIZE ?? 8);
+const MAX_ROOM_SIZE = Number(process.env.MAX_ROOM_SIZE ?? 64);
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicDir = join(__dirname, "public");
@@ -44,24 +44,97 @@ function validChannelName(value) {
   );
 }
 
+function normalizeDisplayName(value) {
+  const cleaned = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 24);
+  return cleaned || "Player";
+}
+
+function normalizePresenceStatus(value) {
+  return value === "playing" ? "playing" : "lobby";
+}
+
+function normalizeMeta(input) {
+  const meta = input && typeof input === "object" ? input : {};
+  return {
+    name: normalizeDisplayName(meta.name),
+    status: normalizePresenceStatus(meta.status),
+  };
+}
+
+function roomUsedNames(key, ignoreId = null) {
+  const members = rooms.get(key);
+  const used = new Set();
+  if (!members) return used;
+  for (const memberId of members) {
+    if (ignoreId && memberId === ignoreId) continue;
+    const member = clients.get(memberId);
+    const name = member?.meta?.name;
+    if (typeof name === "string" && name) used.add(name.toLowerCase());
+  }
+  return used;
+}
+
+function uniqueName(baseName, key, ignoreId = null) {
+  const base = normalizeDisplayName(baseName);
+  const used = roomUsedNames(key, ignoreId);
+  if (!used.has(base.toLowerCase())) return base;
+
+  for (let i = 0; i < 500; i++) {
+    const candidate = `${base}${Math.floor(Math.random() * 900 + 100)}`;
+    if (!used.has(candidate.toLowerCase())) return candidate;
+  }
+
+  let n = 2;
+  while (n < 10000) {
+    const candidate = `${base}${n}`;
+    if (!used.has(candidate.toLowerCase())) return candidate;
+    n++;
+  }
+  return `${base}${Date.now() % 100000}`;
+}
+
+function relayPeerMeta(client, includeSelfAck = true) {
+  if (!client.app || !client.room) return;
+  const key = roomKey(client.app, client.room);
+  const members = rooms.get(key);
+  if (!members) return;
+
+  if (includeSelfAck) {
+    json(client.ws, { type: "meta-updated", id: client.id, meta: client.meta });
+  }
+
+  for (const peerId of members) {
+    if (peerId === client.id) continue;
+    const peer = clients.get(peerId);
+    if (!peer) continue;
+    json(peer.ws, { type: "peer-meta", id: client.id, meta: client.meta });
+  }
+}
+
 function leaveRoom(clientId) {
   const client = clients.get(clientId);
   if (!client) return;
 
-  const key = roomKey(client.app, client.room);
-  const members = rooms.get(key);
-  if (members) {
-    members.delete(clientId);
-    for (const memberId of members) {
-      const member = clients.get(memberId);
-      if (member) {
-        json(member.ws, { type: "peer-left", id: clientId });
+  if (client.app && client.room) {
+    const key = roomKey(client.app, client.room);
+    const members = rooms.get(key);
+    if (members) {
+      members.delete(clientId);
+      for (const memberId of members) {
+        const member = clients.get(memberId);
+        if (member) {
+          json(member.ws, { type: "peer-left", id: clientId });
+        }
+      }
+      if (members.size === 0) {
+        rooms.delete(key);
       }
     }
-    if (members.size === 0) {
-      rooms.delete(key);
-    }
   }
+
   clients.delete(clientId);
 }
 
@@ -155,10 +228,18 @@ wss.on("connection", (ws) => {
         return;
       }
 
+      const nextMeta = normalizeMeta(meta);
+      nextMeta.name = uniqueName(nextMeta.name, key, clientId);
+
       const peers = Array.from(members);
+      const peerMeta = peers.map((peerId) => {
+        const peer = clients.get(peerId);
+        return { id: peerId, meta: peer?.meta ?? null };
+      });
+
       members.add(clientId);
       rooms.set(key, members);
-      clients.set(clientId, { id: clientId, ws, app, room, meta: meta ?? null });
+      clients.set(clientId, { id: clientId, ws, app, room, meta: nextMeta });
 
       json(ws, {
         type: "welcome",
@@ -166,13 +247,15 @@ wss.on("connection", (ws) => {
         app,
         room,
         peers,
+        peerMeta,
+        meta: nextMeta,
         maxRoomSize: MAX_ROOM_SIZE,
       });
 
       for (const peerId of peers) {
         const peer = clients.get(peerId);
         if (!peer) continue;
-        json(peer.ws, { type: "peer-joined", id: clientId, meta: meta ?? null });
+        json(peer.ws, { type: "peer-joined", id: clientId, meta: nextMeta });
       }
       return;
     }
@@ -203,6 +286,32 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (msg.type === "direct") {
+      const targetId = msg.to;
+      if (typeof targetId !== "string") {
+        json(ws, { type: "error", reason: "missing-target" });
+        return;
+      }
+
+      const target = clients.get(targetId);
+      if (!target) {
+        json(ws, { type: "error", reason: "peer-not-found", to: targetId });
+        return;
+      }
+
+      if (target.app !== existingClient.app || target.room !== existingClient.room) {
+        json(ws, { type: "error", reason: "peer-outside-room", to: targetId });
+        return;
+      }
+
+      json(target.ws, {
+        type: "direct",
+        from: clientId,
+        payload: msg.payload ?? null,
+      });
+      return;
+    }
+
     if (msg.type === "broadcast") {
       const key = roomKey(existingClient.app, existingClient.room);
       const members = rooms.get(key);
@@ -217,6 +326,31 @@ wss.on("connection", (ws) => {
           payload: msg.payload ?? null,
         });
       }
+      return;
+    }
+
+    if (msg.type === "set-meta") {
+      if (!msg.patch || typeof msg.patch !== "object") {
+        json(ws, { type: "error", reason: "invalid-meta-patch" });
+        return;
+      }
+
+      const next = {
+        name: existingClient.meta?.name ?? "Player",
+        status: existingClient.meta?.status ?? "lobby",
+      };
+
+      if (Object.prototype.hasOwnProperty.call(msg.patch, "name")) {
+        const key = roomKey(existingClient.app, existingClient.room);
+        next.name = uniqueName(normalizeDisplayName(msg.patch.name), key, existingClient.id);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(msg.patch, "status")) {
+        next.status = normalizePresenceStatus(msg.patch.status);
+      }
+
+      existingClient.meta = next;
+      relayPeerMeta(existingClient, true);
       return;
     }
 
