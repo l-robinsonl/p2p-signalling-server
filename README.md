@@ -1,15 +1,15 @@
 # p2p-signalling-server
 
-Lightweight Node signalling server for WebRTC P2P sessions.
+Lightweight signalling server for WebRTC P2P sessions.
 
-## Features
+## Protocol
 
 - Generic signalling by `app` + `room`
 - Peer discovery (`welcome`, `peer-joined`, `peer-left`)
 - Relay for SDP / ICE (`signal`)
 - Optional room broadcast (`broadcast`)
 
-## Run
+## Local run (Node)
 
 ```bash
 npm install
@@ -21,8 +21,25 @@ Defaults:
 - HTTP: `http://0.0.0.0:8787`
 - WS: `ws://0.0.0.0:8787/ws`
 
+## Cloudflare Worker + Durable Object
+
+This repo includes a Worker implementation at `src/worker.js` with a Durable Object (`SignalHub`) for WebSocket room state.
+
+Deploy:
+
+```bash
+npm install
+npm run cf:deploy
+```
+
+After deploy, your signalling endpoint is:
+
+- `wss://<your-worker-subdomain>/ws`
+
+Health check:
+
+- `https://<your-worker-subdomain>/healthz`
+
 ## Env
 
-- `PORT` (default: `8787`)
-- `HOST` (default: `0.0.0.0`)
 - `MAX_ROOM_SIZE` (default: `8`)

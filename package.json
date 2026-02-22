@@ -6,9 +6,15 @@
   "description": "Lightweight, game-agnostic WebRTC signalling server.",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "cf:dev": "wrangler dev",
+    "cf:deploy": "wrangler deploy",
+    "cf:tail": "wrangler tail"
   },
   "dependencies": {
     "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "wrangler": "^4.5.0"
   }
 }

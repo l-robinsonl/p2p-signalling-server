@@ -1,0 +1,15 @@
+name = "p2p-signalling-server"
+main = "src/worker.js"
+compatibility_date = "2026-02-22"
+
+[vars]
+MAX_ROOM_SIZE = "8"
+
+[durable_objects]
+bindings = [
+  { name = "SIGNAL_HUB", class_name = "SignalHub" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SignalHub"]
